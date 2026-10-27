@@ -14608,6 +14608,7 @@ out.push(item.id);
 return out;
 },
 getSelectableCount: () => {
+if (S.shareParseMode && S.shareParseListActive && S.shareParseInsightMode && S._shareInsightViewCache && S.display === S._shareInsightViewCache.display) return getDisplayMembershipStats().total;
 let count = 0;
 const list = Array.isArray(S.display) ? S.display : [];
 for (let i = 0; i < list.length; i++) {
@@ -14625,6 +14626,12 @@ if (!id) return false;
 return S.selMode === 'all' ? !S.selEx.has(id) : S.sel.has(id);
 },
 getSelectedCount: () => {
+if (S.shareParseMode && S.shareParseListActive && S.shareParseInsightMode && S.selMode === 'all' && S._shareInsightViewCache && S.display === S._shareInsightViewCache.display) {
+const membership = getDisplayMembershipStats();
+let excluded = 0;
+for (const id of S.selEx) if (membership.has(id)) excluded += S._displayMembershipCache.counts.get(id) || 0;
+return Math.max(0, membership.total - excluded);
+}
 return S.getSelectedIds().length;
 },
 getSelectedIds: () => {
@@ -31191,6 +31198,7 @@ updateShareParseInsightButtons();
 }
 
 function resetShareParseInsightState(clearData = true) {
+invalidateShareParseInsightView();
 if (S.shareParseInsightAbortController) {
 try { S.shareParseInsightAbortController.abort(); } catch (e) {}
 S.shareParseInsightAbortController = null;
@@ -31245,7 +31253,11 @@ const wa = charWeight(aa), wb = charWeight(bb);
 return wa !== wb ? wa - wb : collator.compare(aa, bb);
 };
 const asSize = v => parseInt(v || 0, 10) || 0;
-const asTime = v => v ? new Date(v).getTime() || 0 : 0;
+const timeKeys = new Map();
+const asTime = v => {
+if (!timeKeys.has(v)) timeKeys.set(v, v ? new Date(v).getTime() || 0 : 0);
+return timeKeys.get(v);
+};
 const asDur = item => parseFloat((item && item.params && item.params.duration) || item.duration || item.media_duration || 0) || 0;
 const asPath = item => String((item && (item._shareFilePathText || item._pathStr)) || (item && item._sharePath ? getSharePathText(item._sharePath) : '') || '');
 const extGroup = item => {
@@ -31311,30 +31323,61 @@ return state.cat === 'other' ? !definedExts.has(ext) : matchExts.includes(ext);
 });
 }
 
+// The viewport must never re-sort or re-index an unchanged insight dataset.
+function invalidateShareParseInsightView() {
+S._shareInsightViewCache = null;
+}
+
 function syncShareParseInsightMirror() {
 if (!(S.shareParseMode && S.shareParseListActive && S.shareParseInsightMode)) return false;
-const items = Array.isArray(S.shareParseInsightItems) ? S.shareParseInsightItems : [];
-const baseDisplay = filterShareInsightItemsByCategory(items);
+if (!Array.isArray(S.shareParseInsightItems)) S.shareParseInsightItems = [];
+const items = S.shareParseInsightItems;
+const state = S.shareParseInsightFilterState || {};
 const q = String(S.search || '').trim().toLowerCase();
 const includePath = !!(UI.chkSearchPath && UI.chkSearchPath.checked);
-const pathQ = normalizeSharePathSearchText(q);
-const display = sortShareParseDisplayList(q ? baseDisplay.filter(item => {
-if (!item || item.isHeader) return false;
-const name = String(item.name || '').toLowerCase();
-if (name.includes(q)) return true;
-if (!includePath) return false;
-const path = normalizeSharePathSearchText(item._shareFilePathText || item._pathStr || getSharePathText(item._sharePath) || '');
-return path.includes(pathQ);
-}) : baseDisplay);
-if (!S.shareParseInsightItemMap || typeof S.shareParseInsightItemMap.clear !== 'function') S.shareParseInsightItemMap = new Map();
-S.shareParseInsightItemMap.clear();
-items.forEach(item => { if (item && item.id) S.shareParseInsightItemMap.set(item.id, item); });
-S.items = items;
-S.display = display;
-if (S.itemMap && typeof S.itemMap.clear === 'function') {
-S.itemMap.clear();
-display.forEach(item => { if (item && item.id && !item.isHeader) S.itemMap.set(item.id, item); });
+const lang = getLang();
+const key = JSON.stringify([q, includePath, !!state.active, state.cat || 'all', state.ext || 'all', S.sort, S.dir, !!S.folderFirst, lang]);
+let cache = S._shareInsightViewCache;
+if (!cache || cache.items !== items || cache.length !== items.length) {
+const index = new Map();
+items.forEach(item => { if (item && item.id) index.set(item.id, item); });
+cache = { items, length: items.length, index, searchText: new WeakMap() };
+S._shareInsightViewCache = cache;
 }
+if (cache.key !== key) {
+const pathQ = normalizeSharePathSearchText(q);
+const sortKey = JSON.stringify([S.sort, S.dir, !!S.folderFirst, lang]);
+if (cache.sortKey !== sortKey) {
+cache.sorted = sortShareParseDisplayList(items);
+cache.sortKey = sortKey;
+}
+const baseDisplay = filterShareInsightItemsByCategory(cache.sorted);
+const matches = q ? baseDisplay.filter(item => {
+if (!item || item.isHeader) return false;
+let text = cache.searchText.get(item);
+if (!text) {
+text = { name: String(item.name || '').toLowerCase() };
+cache.searchText.set(item, text);
+}
+if (text.name.includes(q)) return true;
+if (!includePath) return false;
+if (text.path === undefined) text.path = normalizeSharePathSearchText(item._shareFilePathText || item._pathStr || getSharePathText(item._sharePath) || '');
+return text.path.includes(pathQ);
+}) : baseDisplay;
+cache.display = matches;
+cache.displayMap = new Map();
+cache.display.forEach(item => { if (item && item.id && !item.isHeader) cache.displayMap.set(item.id, item); });
+cache.key = key;
+cache.displayMapSize = cache.displayMap.size;
+}
+if (cache.displayMap.size !== cache.displayMapSize) {
+cache.displayMap = new Map(cache.display.filter(item => item && item.id && !item.isHeader).map(item => [item.id, item]));
+}
+S.shareParseInsightItemMap = cache.index;
+S.shareParseInsightDisplay = cache.display;
+S.items = items;
+S.display = cache.display;
+S.itemMap = cache.displayMap;
 return true;
 }
 
@@ -34352,6 +34395,7 @@ await showAlert(`${summary}\n\n${preview}`, L.title_alert);
 
 function mergeSharePlayableDetail(item, detail) {
 if (!item || !detail) return item;
+if (item._isShareInsightItem) invalidateShareParseInsightView();
 const directUrl = getShareDirectUrl(detail);
 Object.assign(item, {
 name: detail.name || item.name,
